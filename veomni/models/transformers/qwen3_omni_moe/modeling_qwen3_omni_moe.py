@@ -34,17 +34,20 @@ from transformers import (
 from transformers.cache_utils import DynamicCache
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPast
 from transformers.processing_utils import Unpack
 
 from ....data.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import (
     gather_heads_scatter_seq,
+    gather_outputs,
     gather_seq_scatter_heads,
     reduce_sequence_parallel_loss,
+    slice_input_tensor,
     slice_position_embedding,
     sp_pad_and_slice,
+    unpad_tensor,
 )
 from ....distributed.sequence_parallel.ulysses import _Gather
 from ....utils import logging
@@ -170,6 +173,138 @@ def qwen3_omni_moe_vision_encoder_dummy_forward(
         grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
         dummy_data = {"hidden_states": pixel_values, "grid_thw": grid_thw}
     return self(**dummy_data)
+
+
+# ================================================================
+# Helper: _get_feat_extract_output_lengths
+# Computes the output length of the convolutional layers in audio encoder
+# ================================================================
+def _get_feat_extract_output_lengths(input_lengths):
+    input_lengths_leave = input_lengths % 100
+    feat_lengths = (input_lengths_leave - 1) // 2 + 1
+    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+    return output_lengths
+
+
+# ================================================================
+# PATCH: Qwen3OmniMoeAudioEncoder.forward
+# 1. SP: gather input features at the start, remove SP padding
+# 2. SP: slice hidden_states before encoder layers for distributed computation
+# 3. SP: pad cu_seqlens to match sliced hidden_states
+# ================================================================
+def qwen3_omni_moe_audio_encoder_forward(
+    self: hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder,
+    input_features,
+    feature_lens=None,
+    aftercnn_lens=None,
+):
+    r"""
+    feature_lens (`torch.LongTensor` of shape `(batch_size,)`):
+        mel length
+    aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
+        mel length after cnn
+    """
+    # --- Patch.1 ---
+    # Modification: SP support - gather input features and remove padding
+    if get_parallel_state().sp_enabled:
+        unpadded_dim_len = torch.sum(feature_lens)
+        input_features = gather_outputs(input_features, gather_dim=0, group=get_parallel_state().sp_group)
+        sp_padding_size = input_features.size(0) - unpadded_dim_len
+        if sp_padding_size > 0:
+            input_features = unpad_tensor(input_features, dim=0, padding_size=sp_padding_size)
+    # --- Patch.1 ---
+
+    aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
+    chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+
+    chunk_lengths = torch.tensor(
+        [self.n_window * 2] * chunk_num.sum(),
+        dtype=torch.long,
+        device=feature_lens.device,
+    )
+    tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
+    chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
+    chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+
+    chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
+    padded_feature = torch.nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
+    feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
+    padded_mask_after_cnn = torch.nn.utils.rnn.pad_sequence(
+        [torch.ones(length, dtype=torch.bool, device=padded_feature.device) for length in feature_lens_after_cnn],
+        batch_first=True,
+    )
+    padded_feature = padded_feature.unsqueeze(1)
+    # Split to chunk to avoid OOM during convolution
+    padded_embeds = []
+    for chunk in padded_feature.split(self.conv_chunksize, dim=0):
+        padded_embed = F.gelu(self.conv2d1(chunk))
+        padded_embed = F.gelu(self.conv2d2(padded_embed))
+        padded_embed = F.gelu(self.conv2d3(padded_embed))
+        padded_embeds.append(padded_embed)
+    padded_embed = torch.cat(padded_embeds, dim=0)
+    b, c, f, t = padded_embed.size()
+    padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
+
+    positional_embedding = (
+        self.positional_embedding.positional_embedding[: padded_embed.shape[1], :].unsqueeze(0).to(padded_embed.dtype)
+    )
+    padded_embed = padded_embed + positional_embedding
+    hidden_states = padded_embed[padded_mask_after_cnn]
+    cu_chunk_lens = [0]
+    window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
+    for cnn_len in aftercnn_lens:
+        cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
+        remainder = cnn_len % window_aftercnn
+        if remainder != 0:
+            cu_chunk_lens += [remainder]
+    cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
+
+    # --- Patch.2 ---
+    # Modification: SP support - slice hidden_states before encoder layers
+    if get_parallel_state().sp_enabled:
+        unpadded_seq_len = cu_seqlens[-1]
+        hidden_states = slice_input_tensor(hidden_states, dim=0, group=get_parallel_state().sp_group)
+        # Compute padding size and add to cu_seqlens if needed
+        pad_seq_len = hidden_states.size(0) * get_parallel_state().sp_size - unpadded_seq_len
+        if pad_seq_len > 0:
+            new_cumsum = cu_seqlens[-1] + pad_seq_len
+            cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+    # --- Patch.2 ---
+
+    for encoder_layer in self.layers:
+        layer_outputs = encoder_layer(
+            hidden_states,
+            cu_seqlens,
+        )
+
+        hidden_states = layer_outputs[0]
+
+    hidden_states = self.ln_post(hidden_states)
+    hidden_states = self.proj1(hidden_states)
+    hidden_states = self.act(hidden_states)
+    hidden_states = self.proj2(hidden_states)
+
+    return BaseModelOutput(last_hidden_state=hidden_states)
+
+
+# ================================================================
+# PATCH: Qwen3OmniMoeAudioEncoder.dummy_forward (NEW)
+# Prevent FSDP reduce-scatter hang when some ranks get None input_features
+# while others get valid input_features
+# ================================================================
+def qwen3_omni_moe_audio_encoder_dummy_forward(
+    self: hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder,
+):
+    if getattr(self, "_dummy_data", None) is None:
+        input_features = torch.randn((4, 128), dtype=self.dtype, device=self.device)
+        feature_lens = torch.tensor([4], dtype=torch.int64, device=self.device)
+        aftercnn_lens = torch.tensor([2], dtype=torch.int64, device=self.device)
+        self._dummy_data = {
+            "input_features": input_features,
+            "feature_lens": feature_lens,
+            "aftercnn_lens": aftercnn_lens,
+        }
+    return self(**self._dummy_data)
 
 
 # ================================================================
@@ -411,7 +546,8 @@ def qwen3_omni_moe_thinker_get_position_id_func(
 
 # ================================================================
 # PATCH: Qwen3OmniMoeThinkerForConditionalGeneration.get_audio_features
-# 1. Raise NotImplementedError when SP is enabled (audio SP not yet supported)
+# 1. Support SP via patched audio encoder (gather/slice handled inside audio_tower)
+# 2. Keep compatibility with HF feature_attention_mask inputs
 # ================================================================
 def qwen3_omni_moe_thinker_get_audio_features(
     self: hf_qwen3_omni_moe.Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -426,21 +562,28 @@ def qwen3_omni_moe_thinker_get_audio_features(
         input_features (`torch.FloatTensor`):
             The tensors corresponding to the input audios.
         feature_attention_mask (`torch.LongTensor`, *optional*):
-            Mask to avoid performing attention on padding feature indices. Mask values selected in `[0, 1]`:
+            Audio feature mask in HF format. Needed when `input_features` is 3D.
         audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
             The length of feature shape of each audio in LLM.
     """
-    # TODO audio sp support
-    if get_parallel_state().sp_enabled:
-        raise NotImplementedError("audio sp is not supported yet.")
-    if feature_attention_mask is not None:
+    if audio_feature_lengths is None and feature_attention_mask is not None:
         audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+
+    if input_features.ndim == 3:
+        if feature_attention_mask is None:
+            raise ValueError("feature_attention_mask is required when input_features is 3D.")
+        # HF audio path uses (bsz, mel_bins, mel_len); convert back to VeOmni 2D packed format.
         input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
 
-    feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+    if audio_feature_lengths is None:
+        raise ValueError("audio_feature_lengths or feature_attention_mask must be provided for audio features.")
+
+    audio_feat_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
+    feature_lens = audio_feature_lengths
     audio_outputs = self.audio_tower(
         input_features,
         feature_lens=feature_lens,
+        aftercnn_lens=audio_feat_lengths,
     )
     audio_features = audio_outputs.last_hidden_state
 
@@ -467,7 +610,6 @@ def qwen3_omni_moe_thinker_forward(
     image_grid_thw=None,
     video_grid_thw=None,
     attention_mask=None,
-    feature_attention_mask=None,
     audio_feature_lengths=None,
     position_ids=None,
     past_key_values=None,
@@ -486,11 +628,6 @@ def qwen3_omni_moe_thinker_forward(
         The temporal, height and width of feature shape of each image in LLM.
     video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
         The temporal, height and width of feature shape of each video in LLM.
-    feature_attention_mask (`torch.Tensor` of shape `(batch_size, feature_sequence_length)`, *optional*):
-        Mask to avoid performing attention on padding feature indices. Mask values selected in `[0, 1]`:
-
-        - 1 for tokens that are **not masked**,
-        - 0 for tokens that are **masked**.
     audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
         The length of feature shape of each audio in LLM.
     rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
@@ -528,6 +665,7 @@ def qwen3_omni_moe_thinker_forward(
     for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
         if key in kwargs:
             flash_attn_kwargs[key] = kwargs.pop(key)
+    feature_attention_mask = kwargs.pop("feature_attention_mask", None)
     # --- Patch.2 ---
 
     # --- Patch.3 ---
@@ -539,15 +677,40 @@ def qwen3_omni_moe_thinker_forward(
     # --- Patch.3 ---
 
     # 2. Merge text , audios , image and video
-    if input_features is not None:
+    # --- Patch: Audio SP + FSDP support ---
+    if input_features is not None and audio_feature_lengths is None and feature_attention_mask is not None:
+        audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+
+    if input_features is not None and audio_feature_lengths is not None:
+        valid_mask = audio_feature_lengths != 0
+        audio_feature_lengths = audio_feature_lengths[valid_mask]
+        if feature_attention_mask is not None:
+            feature_attention_mask = feature_attention_mask[valid_mask]
+        if input_features.ndim == 3:
+            input_features = input_features[valid_mask]
+        if input_features.numel() == 0:
+            input_features = None
+
+    if input_features is not None and audio_feature_lengths is not None:
         audio_features = self.get_audio_features(
             input_features,
             feature_attention_mask=feature_attention_mask,
             audio_feature_lengths=audio_feature_lengths,
         )
         audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-        audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
+        if get_parallel_state().sp_enabled:
+            # audio_features gathered in audio_tower, scatter heads to match inputs_embeds layout
+            audio_features = gather_seq_scatter_heads(
+                audio_features, seq_dim=0, head_dim=1, group=get_parallel_state().sp_group
+            )
+        audio_features = audio_features[: audio_mask.sum()]
+        audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+    elif get_parallel_state().fsdp_enabled:
+        fake_embeds = self.audio_tower.dummy_forward().last_hidden_state.mean() * 0.0
+        fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds + fake_embeds
+    # --- End Patch: Audio SP + FSDP support ---
 
     # Initialize fake_deepstack to None
     fake_deepstack = None
@@ -761,11 +924,6 @@ def qwen3_omni_moe_thinker_forward(
             deepstack_visual_embeds = None
     # --- Patch.7 ---
 
-    if feature_attention_mask is not None:
-        audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-    else:
-        audio_feature_lengths = None
-
     if attention_mask is not None and position_ids is None:
         if (
             cache_position is None
@@ -893,6 +1051,10 @@ def apply_veomni_qwen3_omni_moe_patch():
         "Qwen3OmniMoeThinkerTextDecoderLayer",
         "Qwen3OmniMoeVisionBlock",
     ]
+
+    # Patch AudioEncoder
+    hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder.forward = qwen3_omni_moe_audio_encoder_forward
+    hf_qwen3_omni_moe.Qwen3OmniMoeAudioEncoder.dummy_forward = qwen3_omni_moe_audio_encoder_dummy_forward
 
     # Patch VisionEncoder
     hf_qwen3_omni_moe.Qwen3OmniMoeVisionEncoder.forward = qwen3_omni_moe_vision_encoder_forward
