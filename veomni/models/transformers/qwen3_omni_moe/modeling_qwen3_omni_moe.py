@@ -205,13 +205,14 @@ def qwen3_omni_moe_audio_encoder_forward(
         mel length after cnn
     """
     # --- Patch.1 ---
-    # Modification: SP support - gather input features and remove padding
+    # Modification: SP support - gather input features along time dimension and remove padding
+    # input_features shape: (mel_bins, total_time_len), time is dim=1
     if get_parallel_state().sp_enabled:
         unpadded_dim_len = torch.sum(feature_lens)
-        input_features = gather_outputs(input_features, gather_dim=0, group=get_parallel_state().sp_group)
-        sp_padding_size = input_features.size(0) - unpadded_dim_len
+        input_features = gather_outputs(input_features, gather_dim=1, group=get_parallel_state().sp_group)
+        sp_padding_size = input_features.size(1) - unpadded_dim_len
         if sp_padding_size > 0:
-            input_features = unpad_tensor(input_features, dim=0, padding_size=sp_padding_size)
+            input_features = unpad_tensor(input_features, dim=1, padding_size=sp_padding_size)
     # --- Patch.1 ---
 
     aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
@@ -681,6 +682,12 @@ def qwen3_omni_moe_thinker_forward(
     if input_features is not None and audio_feature_lengths is None and feature_attention_mask is not None:
         audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
 
+    if input_features is not None and audio_feature_lengths is None:
+        raise ValueError(
+            "input_features is provided but both audio_feature_lengths and feature_attention_mask are missing. "
+            "At least one of them must be provided to fuse audio features."
+        )
+
     if input_features is not None and audio_feature_lengths is not None:
         valid_mask = audio_feature_lengths != 0
         audio_feature_lengths = audio_feature_lengths[valid_mask]
@@ -836,6 +843,10 @@ def qwen3_omni_moe_thinker_forward(
 
             # Determine which sequence positions belong to this rank
             seq_len = image_mask_1d.shape[1]
+            assert seq_len % sp_size == 0, (
+                f"Image mask seq_len ({seq_len}) must be divisible by sp_size ({sp_size}). "
+                f"Check upstream padding logic."
+            )
             seq_per_rank = seq_len // sp_size
             rank_start = sp_rank * seq_per_rank
             rank_end = rank_start + seq_per_rank
@@ -860,6 +871,10 @@ def qwen3_omni_moe_thinker_forward(
             # Same logic for video embeddings
             video_mask_1d = video_mask[..., 0]  # (batch_size, seq_len)
             seq_len = video_mask_1d.shape[1]
+            assert seq_len % sp_size == 0, (
+                f"Video mask seq_len ({seq_len}) must be divisible by sp_size ({sp_size}). "
+                f"Check upstream padding logic."
+            )
             seq_per_rank = seq_len // sp_size
             rank_start = sp_rank * seq_per_rank
             rank_end = rank_start + seq_per_rank
