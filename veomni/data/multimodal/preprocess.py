@@ -373,6 +373,53 @@ def tulu_3_sft_mixture_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
+# ============================================================================
+# Lumine Custom Preprocessor
+# ============================================================================
+# Format: {"image": "frame_00001.jpg", "text": "<|action_start|>0 0 0 ; W A ; ; ; ; ; ;<|action_end|>"}
+@PREPROCESSOR_REGISTRY.register("lumine_pretrain")
+def lumine_pretrain_preprocess(conversations, **kwargs):
+    """
+    Lumine pre-training data format.
+    Input: {"image": "frame_00001.jpg", "text": "<|action_start|>..."}
+    Output: [["user", ("image", None)], ["assistant", ("text", "<|action_start|>...")]]
+    """
+    # conversations is a dict with "image" and "text" keys
+    image = conversations.get("image", "")
+    action_text = conversations.get("text", "")
+
+    constructed_conversation = [["user", ("image", None)], ["assistant", ("text", action_text)]]
+    return constructed_conversation
+
+
+@PREPROCESSOR_REGISTRY.register("lumine_instruct")
+def lumine_instruct_preprocess(conversations, **kwargs):
+    """
+    Lumine instruction-following data format.
+    Input: {"instruction": "Navigate to waypoint", "image": "frame_00001.jpg", "answer": "<|action_start|>..."}
+    Output: [["user", ("text", "Navigate to waypoint"), ("image", None)], ["assistant", ("text", "<|action_start|>...")]]
+    """
+    instruction = conversations.get("instruction", "")
+    action_text = conversations.get("answer", "")
+
+    constructed_conversation = [["user", ("text", instruction), ("image", None)], ["assistant", ("text", action_text)]]
+    return constructed_conversation
+
+
+@PREPROCESSOR_REGISTRY.register("lumine_reasoning")
+def lumine_reasoning_preprocess(conversations, **kwargs):
+    """
+    Lumine reasoning data format.
+    Input: {"thought": "I need to follow the quest marker", "image": "frame_00001.jpg", "answer": "<|action_start|>..."}
+    Output: [["user", ("text", "I need to follow the quest marker"), ("image", None)], ["assistant", ("text", "<|action_start|>...")]]
+    """
+    thought = conversations.get("thought", "")
+    action_text = conversations.get("answer", "")
+
+    constructed_conversation = [["user", ("text", thought), ("image", None)], ["assistant", ("text", action_text)]]
+    return constructed_conversation
+
+
 # @PREPROCESSOR_REGISTRY.register("your_dataset_name")
 # def your_dataset_preprocess(conversations, **kwargs):
 #     ...
