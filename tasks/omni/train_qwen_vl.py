@@ -402,7 +402,10 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.4f}, lr: {lr:.2e}", refresh=False
+                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.4f}, lr: {lr:.2e}, "
+                f"mfu: {train_metrics.get('mfu', 0):.2%}, tokens/s: {train_metrics.get('tokens_per_second(M)', 0):.2f}M, "
+                f"gpu_mem: {train_metrics.get('max_memory_allocated(GB)', 0):.1f}GB",
+                refresh=False,
             )
             data_loader_tqdm.update()
 
