@@ -138,6 +138,51 @@ def main():
     position_id_func = model.get_position_id_func()
     chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 
+    # LUMINE CUSTOM TOKENS (arXiv:2511.08892)
+    custom_tokens = [
+        "<|action_start|>",
+        "<|action_end|>",
+        "<|thought_start|>",
+        "<|thought_end|>",
+        "LB",
+        "RB",
+        "MB",
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "One",
+        "Two",
+        "Three",
+        "Four",
+        "Five",
+        "Six",
+        "Seven",
+        "Eight",
+        "Nine",
+        "Ten",
+        "Eleven",
+        "Twelve",
+        "Esc",
+        "Tab",
+        "Caps",
+        "Shift",
+        "Ctrl",
+        "Alt",
+        "Space",
+    ]
+
+    num_added_tokens = processor.tokenizer.add_tokens(custom_tokens)
+    if num_added_tokens > 0:
+        logger.info_rank0(f"Added {num_added_tokens} custom tokens from Lumine paper.")
+        model.resize_token_embeddings(len(processor.tokenizer))
+
     if model_config.model_type in ("qwen2_5_vl", "qwen2_vl"):
         transform = partial(
             process_sample_qwen2_5_vl,
