@@ -401,12 +401,15 @@ def main():
             disable=args.train.local_rank != 0,
         )
         data_iterator = iter(train_dataloader)
-        for _ in range(start_step, args.train.train_steps):
+        for step_in_epoch in range(start_step, args.train.train_steps):
             global_step += 1
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
             except StopIteration:
                 logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
+                # Update progress bar to reflect actual steps completed
+                data_loader_tqdm.total = step_in_epoch
+                data_loader_tqdm.refresh()
                 break
 
             if global_step == 1:
@@ -514,6 +517,24 @@ def main():
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
+                # Convert to HuggingFace format immediately after saving
+                if args.train.save_hf_weights:
+                    hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+                    logger.info_rank0(f"Converting checkpoint to HuggingFace format at {hf_weights_path}")
+                    save_hf_safetensor(
+                        save_hf_safetensor_path=hf_weights_path,
+                        ckpt_manager=args.train.ckpt_manager,
+                        model_assets=model_assets,
+                        train_architecture=args.train.train_architecture,
+                        save_checkpoint_path=save_checkpoint_path,
+                        output_dir=args.train.output_dir,
+                        is_rank_0=args.train.global_rank == 0,
+                        model=model,
+                        fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+                    )
+                    dist.barrier()
+                    logger.info_rank0(f"HuggingFace checkpoint saved at {hf_weights_path} successfully!")
+
         data_loader_tqdm.close()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
@@ -534,24 +555,29 @@ def main():
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
+            # Convert to HuggingFace format immediately after saving
+            if args.train.save_hf_weights:
+                hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
+                logger.info_rank0(f"Converting checkpoint to HuggingFace format at {hf_weights_path}")
+                save_hf_safetensor(
+                    save_hf_safetensor_path=hf_weights_path,
+                    ckpt_manager=args.train.ckpt_manager,
+                    model_assets=model_assets,
+                    train_architecture=args.train.train_architecture,
+                    save_checkpoint_path=save_checkpoint_path,
+                    output_dir=args.train.output_dir,
+                    is_rank_0=args.train.global_rank == 0,
+                    model=model,
+                    fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+                )
+                dist.barrier()
+                logger.info_rank0(f"HuggingFace checkpoint saved at {hf_weights_path} successfully!")
+
     synchronize()
     # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()
-    # save model in huggingface's format
-    if args.train.save_hf_weights and save_checkpoint_path is not None:
-        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        save_hf_safetensor(
-            save_hf_safetensor_path=hf_weights_path,
-            ckpt_manager=args.train.ckpt_manager,
-            model_assets=model_assets,
-            train_architecture=args.train.train_architecture,
-            save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
-            is_rank_0=args.train.global_rank == 0,
-            model=model,
-            fqn_to_index_mapping=args.model.fqn_to_index_mapping,
-        )
+    # HF conversion now happens immediately after each checkpoint save (see above)
 
     dist.barrier()
     dist.destroy_process_group()
