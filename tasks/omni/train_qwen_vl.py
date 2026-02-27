@@ -190,11 +190,15 @@ def main():
 
         if len(tokens_to_add) > 0:
             num_added_tokens = processor.tokenizer.add_tokens(tokens_to_add)
-            logger.info_rank0(
-                f"Added {num_added_tokens} custom tokens from Lumine paper. Will resize embeddings after loading base weights."
-            )
+            logger.info_rank0(f"Added {num_added_tokens} custom tokens from Lumine paper.")
             logger.info_rank0(
                 f"Original vocab size: {model.config.vocab_size}, New vocab size: {len(processor.tokenizer)}"
+            )
+            # Resize embeddings BEFORE FSDP2 wrapping (meta init, no actual weights yet)
+            logger.info_rank0("Resizing token embeddings to accommodate new tokens...")
+            model.resize_token_embeddings(len(processor.tokenizer))
+            logger.info_rank0(
+                f"Token embeddings resized to {len(processor.tokenizer)}. New tokens will be randomly initialized when weights load."
             )
         else:
             logger.info_rank0("All Lumine custom tokens already present in tokenizer.")

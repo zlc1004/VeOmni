@@ -184,6 +184,30 @@ def _dispatch_parameter(
     if parallel_plan is not None:
         tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
 
+    # Handle vocab size mismatch for embeddings (e.g., when custom tokens are added)
+    if tensor.shape != orig_tensor.shape:
+        if "embed_tokens.weight" in name or "lm_head.weight" in name:
+            # For embedding layers, only copy the overlapping portion
+            min_vocab_size = min(tensor.shape[0], orig_tensor.shape[0])
+            logger.info_rank0(
+                f"Vocab size mismatch for {name}: checkpoint has {tensor.shape[0]}, model has {orig_tensor.shape[0]}. "
+                f"Copying first {min_vocab_size} embeddings."
+            )
+            tensor_to_copy = tensor[:min_vocab_size]
+            if hasattr(orig_tensor, "device_mesh"):  # dtensor
+                if orig_tensor.device.type == "cpu":
+                    raise ValueError("Cannot load dtensor on CPU.")
+                device_mesh = getattr(orig_tensor, "device_mesh")
+                placements = getattr(orig_tensor, "placements")
+                orig_tensor[:min_vocab_size].copy_(dtensor_factory(tensor_to_copy, device_mesh, placements))
+            else:  # not dtensor
+                orig_tensor[:min_vocab_size].copy_(tensor_to_copy.to(orig_tensor))
+            return  # Early return, remaining tokens stay randomly initialized
+        else:
+            raise ValueError(
+                f"Shape mismatch for parameter {name}: checkpoint has {tensor.shape}, model expects {orig_tensor.shape}"
+            )
+
     tensor = tensor.to(orig_tensor)
     if hasattr(orig_tensor, "device_mesh"):  # dtensor
         if orig_tensor.device.type == "cpu":
