@@ -143,6 +143,12 @@ class ModelArguments:
             "veomni/utils/data_balance/balance_sorting_algo.py, SORTING_ALGO_FUNC"
         },
     )
+    add_custom_tokens: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to add Lumine custom tokens to the tokenizer. Set to False for stage 1 pretraining from base model."
+        },
+    )
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:

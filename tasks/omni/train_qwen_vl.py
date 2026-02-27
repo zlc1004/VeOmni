@@ -121,9 +121,13 @@ def main():
     )
 
     logger.info_rank0("Prepare model")
+    # For FSDP2 with meta init: build model structure first, then load weights in FSDP, then resize
+    # We need to NOT pass weights_path here when using meta init + custom tokens
     model = build_foundation_model(
         config_path=args.model.config_path,
-        weights_path=args.model.model_path,
+        weights_path=None
+        if (args.train.init_device == "meta" and args.model.add_custom_tokens)
+        else args.model.model_path,
         init_device=args.train.init_device,
         moe_implementation=args.model.moe_implementation,
         attn_implementation=args.model.attn_implementation,
@@ -139,49 +143,63 @@ def main():
     chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 
     # LUMINE CUSTOM TOKENS (arXiv:2511.08892)
-    custom_tokens = [
-        "<|action_start|>",
-        "<|action_end|>",
-        "<|thought_start|>",
-        "<|thought_end|>",
-        "LB",
-        "RB",
-        "MB",
-        "zero",
-        "one",
-        "two",
-        "three",
-        "four",
-        "five",
-        "six",
-        "seven",
-        "eight",
-        "nine",
-        "One",
-        "Two",
-        "Three",
-        "Four",
-        "Five",
-        "Six",
-        "Seven",
-        "Eight",
-        "Nine",
-        "Ten",
-        "Eleven",
-        "Twelve",
-        "Esc",
-        "Tab",
-        "Caps",
-        "Shift",
-        "Ctrl",
-        "Alt",
-        "Space",
-    ]
+    # Add custom tokens for agent actions, thoughts, and UI elements
+    num_added_tokens = 0
+    if args.model.add_custom_tokens:
+        custom_tokens = [
+            "<|action_start|>",
+            "<|action_end|>",
+            "<|thought_start|>",
+            "<|thought_end|>",
+            "LB",
+            "RB",
+            "MB",
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "One",
+            "Two",
+            "Three",
+            "Four",
+            "Five",
+            "Six",
+            "Seven",
+            "Eight",
+            "Nine",
+            "Ten",
+            "Eleven",
+            "Twelve",
+            "Esc",
+            "Tab",
+            "Caps",
+            "Shift",
+            "Ctrl",
+            "Alt",
+            "Space",
+        ]
 
-    num_added_tokens = processor.tokenizer.add_tokens(custom_tokens)
-    if num_added_tokens > 0:
-        logger.info_rank0(f"Added {num_added_tokens} custom tokens from Lumine paper.")
-        model.resize_token_embeddings(len(processor.tokenizer))
+        # Check if custom tokens are already in the tokenizer
+        tokens_to_add = [token for token in custom_tokens if token not in processor.tokenizer.get_vocab()]
+
+        if len(tokens_to_add) > 0:
+            num_added_tokens = processor.tokenizer.add_tokens(tokens_to_add)
+            logger.info_rank0(
+                f"Added {num_added_tokens} custom tokens from Lumine paper. Will resize embeddings after loading base weights."
+            )
+            logger.info_rank0(
+                f"Original vocab size: {model.config.vocab_size}, New vocab size: {len(processor.tokenizer)}"
+            )
+        else:
+            logger.info_rank0("All Lumine custom tokens already present in tokenizer.")
+    else:
+        logger.info_rank0("Skipping custom token addition (add_custom_tokens=False in config).")
 
     if model_config.model_type in ("qwen2_5_vl", "qwen2_vl"):
         transform = partial(
@@ -280,6 +298,15 @@ def main():
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
+
+    # Resize embeddings AFTER loading weights if custom tokens were added
+    if num_added_tokens > 0:
+        logger.info_rank0(
+            f"Resizing model embeddings from {model_config.vocab_size} to {len(processor.tokenizer)} to accommodate {num_added_tokens} new tokens."
+        )
+        model.resize_token_embeddings(len(processor.tokenizer))
+        logger.info_rank0("Token embeddings resized. New token embeddings initialized randomly.")
+
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
