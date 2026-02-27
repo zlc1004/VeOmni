@@ -406,6 +406,19 @@ def lumine_instruct_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
+@PREPROCESSOR_REGISTRY.register("lumine_knowledge")
+def lumine_knowledge_preprocess(conversations, **kwargs):
+    """
+    Lumine knowledge-injection data format (from DataInject/metadata2training.py --format simple).
+    Input: {"id": "...", "question": "...", "answer": "..."}
+    Output: [["user", ("text", "Q")], ["assistant", ("text", "A")]]
+    Text-only: no image (pure lore/wiki Q&A).
+    """
+    question = conversations.get("question", "")
+    answer = conversations.get("answer", "")
+    return [["user", ("text", question)], ["assistant", ("text", answer)]]
+
+
 @PREPROCESSOR_REGISTRY.register("lumine_reasoning")
 def lumine_reasoning_preprocess(conversations, **kwargs):
     """
