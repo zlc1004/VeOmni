@@ -530,7 +530,7 @@ def main():
                         output_dir=args.train.output_dir,
                         is_rank_0=args.train.global_rank == 0,
                         model=model,
-                        fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+                        fqn_to_index_mapping=None,  # Don't filter weights - save all model weights
                     )
                     dist.barrier()
                     logger.info_rank0(f"HuggingFace checkpoint saved at {hf_weights_path} successfully!")
@@ -585,7 +585,7 @@ def main():
                     output_dir=args.train.output_dir,
                     is_rank_0=args.train.global_rank == 0,
                     model=model,
-                    fqn_to_index_mapping=args.model.fqn_to_index_mapping,
+                    fqn_to_index_mapping=None,  # Don't filter weights - save all model weights
                 )
                 dist.barrier()
                 logger.info_rank0(f"HuggingFace checkpoint saved at {hf_weights_path} successfully!")

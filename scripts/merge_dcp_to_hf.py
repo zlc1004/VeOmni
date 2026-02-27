@@ -79,6 +79,10 @@ def _get_sharding_plan(
     """
     Create sharding plan from checkpoint metadata without loading weights.
 
+    This function scans the DCP checkpoint and includes ALL model weights
+    (vision, language, embeddings, etc.) without filtering. Only non-model
+    keys (optimizer states, etc.) are excluded.
+
     Returns:
         shards: List of {hf_key: dcp_key} dicts per shard
         total_size: Total size in bytes
@@ -245,7 +249,13 @@ def save_model_weights(
     safe_serialization: bool = True,
     model_assets: Optional[Sequence["ModelAssets"]] = None,
 ) -> None:
-    """Convert DCP checkpoint to HuggingFace format with shard-by-shard processing (memory-efficient)."""
+    """
+    Convert DCP checkpoint to HuggingFace format with shard-by-shard processing (memory-efficient).
+
+    IMPORTANT: This function saves ALL model weights found in the checkpoint without filtering.
+    This is the correct behavior for multi-stage training where model architecture may change
+    between stages (e.g., unfreezing vision tower, adding custom tokens).
+    """
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Saving model weights to {output_dir}")
     logger.info(
