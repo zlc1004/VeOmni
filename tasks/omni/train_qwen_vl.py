@@ -535,6 +535,23 @@ def main():
                     dist.barrier()
                     logger.info_rank0(f"HuggingFace checkpoint saved at {hf_weights_path} successfully!")
 
+                    # Create 'latest' symlink to this checkpoint for easy reference
+                    if args.train.global_rank == 0:
+                        import pathlib
+
+                        checkpoints_dir = pathlib.Path(args.train.save_checkpoint_path)
+                        latest_symlink = checkpoints_dir / "latest"
+                        checkpoint_dir = pathlib.Path(save_checkpoint_path)
+
+                        # Remove old symlink if it exists
+                        if latest_symlink.exists() or latest_symlink.is_symlink():
+                            latest_symlink.unlink()
+
+                        # Create new symlink pointing to current checkpoint
+                        latest_symlink.symlink_to(checkpoint_dir.name, target_is_directory=True)
+                        logger.info_rank0(f"Updated 'latest' symlink to point to {checkpoint_dir.name}")
+                    dist.barrier()
+
         data_loader_tqdm.close()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
@@ -572,6 +589,23 @@ def main():
                 )
                 dist.barrier()
                 logger.info_rank0(f"HuggingFace checkpoint saved at {hf_weights_path} successfully!")
+
+                # Create 'latest' symlink to this checkpoint for easy reference
+                if args.train.global_rank == 0:
+                    import pathlib
+
+                    checkpoints_dir = pathlib.Path(args.train.save_checkpoint_path)
+                    latest_symlink = checkpoints_dir / "latest"
+                    checkpoint_dir = pathlib.Path(save_checkpoint_path)
+
+                    # Remove old symlink if it exists
+                    if latest_symlink.exists() or latest_symlink.is_symlink():
+                        latest_symlink.unlink()
+
+                    # Create new symlink pointing to current checkpoint
+                    latest_symlink.symlink_to(checkpoint_dir.name, target_is_directory=True)
+                    logger.info_rank0(f"Updated 'latest' symlink to point to {checkpoint_dir.name}")
+                dist.barrier()
 
     synchronize()
     # release memory
