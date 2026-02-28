@@ -402,6 +402,14 @@ def main():
     logger.info_rank0(f"[LUMINE DEBUG]   train_steps per epoch: {args.train.train_steps}")
     logger.info_rank0(f"[LUMINE DEBUG]   start_epoch: {start_epoch}")
     logger.info_rank0(f"[LUMINE DEBUG]   start_step: {start_step}")
+
+    # CRITICAL CHECK: If train_steps is 0, we need to know WHY before the loop doesn't execute
+    if args.train.train_steps == 0:
+        logger.error(f"[LUMINE CRITICAL] train_steps is 0! Training will not execute!")
+        logger.error(f"[LUMINE CRITICAL] This means the dataloader will never iterate.")
+        logger.error(f"[LUMINE CRITICAL] Check the compute_train_steps() debug output above.")
+        raise RuntimeError(f"train_steps is 0 - cannot train with 0 steps per epoch!")
+
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)

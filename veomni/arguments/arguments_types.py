@@ -779,7 +779,18 @@ class TrainingArguments:
         """
         Computes the training steps per epoch according to the data length.
         """
+        logger.info(f"[LUMINE DEBUG compute_train_steps] Inputs:")
+        logger.info(f"[LUMINE DEBUG compute_train_steps]   max_seq_len: {max_seq_len}")
+        logger.info(f"[LUMINE DEBUG compute_train_steps]   train_size: {train_size}")
+        logger.info(f"[LUMINE DEBUG compute_train_steps]   dataset_length: {dataset_length}")
+        logger.info(f"[LUMINE DEBUG compute_train_steps]   self.rmpad: {self.rmpad}")
+        logger.info(f"[LUMINE DEBUG compute_train_steps]   self.rmpad_with_pos_ids: {self.rmpad_with_pos_ids}")
+        logger.info(f"[LUMINE DEBUG compute_train_steps]   self.dyn_bsz: {self.dyn_bsz}")
+        logger.info(f"[LUMINE DEBUG compute_train_steps]   self.dataloader_batch_size: {self.dataloader_batch_size}")
+        logger.info(f"[LUMINE DEBUG compute_train_steps]   self.max_steps: {self.max_steps}")
+
         if self.rmpad or self.rmpad_with_pos_ids:
+            logger.info(f"[LUMINE DEBUG compute_train_steps] Taking rmpad branch")
             if self.dyn_bsz:
                 assert max_seq_len is not None and train_size is not None, "max_seq_len and train_size are required."
                 token_micro_bsz = self.micro_batch_size * max_seq_len
@@ -800,10 +811,17 @@ class TrainingArguments:
                         "For iterable dataset, please provide 'max_steps' or set dyn_bsz=True when removing padding."
                     )
         elif dataset_length is not None:
+            logger.info(f"[LUMINE DEBUG compute_train_steps] Taking dataset_length branch (rmpad=False)")
             self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)  # assuming drop_last is true
+            logger.info(
+                f"[LUMINE DEBUG compute_train_steps] Calculated: floor({dataset_length} / {self.dataloader_batch_size}) = {self._train_steps}"
+            )
         elif self.max_steps is not None:
+            logger.info(f"[LUMINE DEBUG compute_train_steps] Taking max_steps branch")
             self._train_steps = self.max_steps
+            logger.info(f"[LUMINE DEBUG compute_train_steps] Using max_steps: {self._train_steps}")
         else:
+            logger.error(f"[LUMINE DEBUG compute_train_steps] ERROR: No valid path! Raising ValueError")
             raise ValueError("Please provide `dataset_length` or `max_steps`!")
 
     @property
