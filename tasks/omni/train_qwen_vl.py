@@ -255,9 +255,17 @@ def main():
         **asdict(args.data),
     )
     dataset_length = None if not hasattr(train_dataset, "__len__") else len(train_dataset)
+    logger.info(f"[LUMINE DEBUG] Raw dataset_length: {dataset_length}")
+    logger.info(f"[LUMINE DEBUG] datasets_type: {args.data.datasets_type}")
+    logger.info(f"[LUMINE DEBUG] data_parallel_size: {args.train.data_parallel_size}")
     if args.data.datasets_type == "mapping":
         dataset_length = dataset_length / args.train.data_parallel_size
+        logger.info(f"[LUMINE DEBUG] dataset_length after division: {dataset_length}")
+    logger.info(f"[LUMINE DEBUG] dataloader_batch_size: {args.train.dataloader_batch_size}")
+    logger.info(f"[LUMINE DEBUG] global_batch_size: {args.train.global_batch_size}")
+    logger.info(f"[LUMINE DEBUG] micro_batch_size: {args.train.micro_batch_size}")
     args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, dataset_length)
+    logger.info(f"[LUMINE DEBUG] Computed train_steps: {args.train.train_steps}")
 
     train_dataloader = build_dataloader(
         dataloader_type=args.data.dataloader_type,
@@ -389,6 +397,11 @@ def main():
     )
     model.train()
     logger.info_rank0("Start training")
+    logger.info_rank0(f"[LUMINE DEBUG] Starting training loop with:")
+    logger.info_rank0(f"[LUMINE DEBUG]   num_train_epochs: {args.train.num_train_epochs}")
+    logger.info_rank0(f"[LUMINE DEBUG]   train_steps per epoch: {args.train.train_steps}")
+    logger.info_rank0(f"[LUMINE DEBUG]   start_epoch: {start_epoch}")
+    logger.info_rank0(f"[LUMINE DEBUG]   start_step: {start_step}")
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
@@ -517,40 +530,12 @@ def main():
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
-                # Convert to HuggingFace format immediately after saving
+                # Skip HF conversion for intermediate step checkpoints to save time
+                # HF conversion will happen only at the end of training (last epoch)
                 if args.train.save_hf_weights:
-                    hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-                    logger.info_rank0(f"Converting checkpoint to HuggingFace format at {hf_weights_path}")
-                    save_hf_safetensor(
-                        save_hf_safetensor_path=hf_weights_path,
-                        ckpt_manager=args.train.ckpt_manager,
-                        model_assets=model_assets,
-                        train_architecture=args.train.train_architecture,
-                        save_checkpoint_path=save_checkpoint_path,
-                        output_dir=args.train.output_dir,
-                        is_rank_0=args.train.global_rank == 0,
-                        model=model,
-                        fqn_to_index_mapping=None,  # Don't filter weights - save all model weights
+                    logger.info_rank0(
+                        f"Skipping HF conversion for intermediate step checkpoint (will convert final checkpoint only)"
                     )
-                    dist.barrier()
-                    logger.info_rank0(f"HuggingFace checkpoint saved at {hf_weights_path} successfully!")
-
-                    # Create 'latest' symlink to this checkpoint for easy reference
-                    if args.train.global_rank == 0:
-                        import pathlib
-
-                        checkpoints_dir = pathlib.Path(args.train.save_checkpoint_path)
-                        latest_symlink = checkpoints_dir / "latest"
-                        checkpoint_dir = pathlib.Path(save_checkpoint_path)
-
-                        # Remove old symlink if it exists
-                        if latest_symlink.exists() or latest_symlink.is_symlink():
-                            latest_symlink.unlink()
-
-                        # Create new symlink pointing to current checkpoint
-                        latest_symlink.symlink_to(checkpoint_dir.name, target_is_directory=True)
-                        logger.info_rank0(f"Updated 'latest' symlink to point to {checkpoint_dir.name}")
-                    dist.barrier()
 
         data_loader_tqdm.close()
         start_step = 0
@@ -572,10 +557,11 @@ def main():
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
-            # Convert to HuggingFace format immediately after saving
-            if args.train.save_hf_weights:
+            # Only convert to HuggingFace format on the LAST epoch to save time
+            is_last_epoch = (epoch + 1) == args.train.num_train_epochs
+            if args.train.save_hf_weights and is_last_epoch:
                 hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-                logger.info_rank0(f"Converting checkpoint to HuggingFace format at {hf_weights_path}")
+                logger.info_rank0(f"Converting final checkpoint to HuggingFace format at {hf_weights_path}")
                 save_hf_safetensor(
                     save_hf_safetensor_path=hf_weights_path,
                     ckpt_manager=args.train.ckpt_manager,
@@ -606,6 +592,10 @@ def main():
                     latest_symlink.symlink_to(checkpoint_dir.name, target_is_directory=True)
                     logger.info_rank0(f"Updated 'latest' symlink to point to {checkpoint_dir.name}")
                 dist.barrier()
+            elif args.train.save_hf_weights:
+                logger.info_rank0(
+                    f"Skipping HF conversion for intermediate epoch {epoch + 1}/{args.train.num_train_epochs} (will convert final epoch only)"
+                )
 
     synchronize()
     # release memory
